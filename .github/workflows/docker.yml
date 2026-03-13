@@ -7,8 +7,8 @@ on:
 
 env:
   REGISTRY: docker.io
-  VALIDATOR_IMAGE: unconst/constantinople-validator
-  MINER_IMAGE: unconst/constantinople-miner
+  VALIDATOR_IMAGE: thebes1618/constantinople-validator
+  MINER_IMAGE: thebes1618/constantinople-miner
 
 jobs:
   build-validator:
