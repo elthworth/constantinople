@@ -11,7 +11,7 @@
 services:
   # ── Gateway Validator ─────────────────────────────────────────────
   validator:
-    image: ${IMAGE_PREFIX:-unconst/constantinople}-validator:latest
+    image: ${IMAGE_PREFIX:-thebes1618/constantinople}-validator:latest
     container_name: constantinople-validator
     restart: unless-stopped
     pull_policy: always
@@ -72,7 +72,7 @@ services:
 
   # ── Miner (GPU) ──────────────────────────────────────────────────
   miner:
-    image: ${IMAGE_PREFIX:-unconst/constantinople}-miner:latest
+    image: ${IMAGE_PREFIX:-thebes1618/constantinople}-miner:latest
     container_name: constantinople-miner
     restart: unless-stopped
     pull_policy: always
