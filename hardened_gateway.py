@@ -71,6 +71,10 @@ from collusion_detector import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("hardened_gateway")
 
+# Version tracking for watchtower/deployment debugging
+GATEWAY_VERSION = "0.3.0"
+GATEWAY_START_TIME = time.time()
+
 
 # ── Chain Weight Setter ──────────────────────────────────────────────────────
 
@@ -157,8 +161,8 @@ class ChainWeightSetter:
         self.total_sets = 0
         self.total_failures = 0
 
-    async def set_weights(self, weights: dict[int, float]) -> bool:
-        """Set weights on chain via subprocess. Returns True on success."""
+    async def set_weights(self, weights: dict[int, float], retries: int = 1) -> bool:
+        """Set weights on chain via subprocess with retry. Returns True on success."""
         if not weights:
             log.warning("[CHAIN] No weights to set")
             return False
@@ -188,36 +192,44 @@ except Exception as e:
     sys.exit(1)
 """
 
-        log.info(f"[CHAIN] Setting weights for {len(uids)} miners on netuid {self.netuid}...")
-        log.info(f"[CHAIN] Weights: {dict(zip(uids, [f'{w:.4f}' for w in weight_values]))}")
+        for attempt in range(1 + retries):
+            if attempt > 0:
+                log.info(f"[CHAIN] Retry {attempt}/{retries} for weight setting...")
+                await asyncio.sleep(5)
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", script,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            log.info(f"[CHAIN] Setting weights for {len(uids)} miners on netuid {self.netuid}...")
+            log.info(f"[CHAIN] Weights: {dict(zip(uids, [f'{w:.4f}' for w in weight_values]))}")
 
-            if proc.returncode == 0:
-                result = stdout.decode().strip()
-                log.info(f"[CHAIN] Weights set successfully: {result}")
-                self.last_set_time = time.time()
-                self.total_sets += 1
-                return True
-            else:
-                err = stderr.decode().strip()
-                log.error(f"[CHAIN] Weight setting failed: {err}")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-c", script,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+
+                if proc.returncode == 0:
+                    result = stdout.decode().strip()
+                    log.info(f"[CHAIN] Weights set successfully: {result}")
+                    self.last_set_time = time.time()
+                    self.total_sets += 1
+                    return True
+                else:
+                    err = stderr.decode().strip()
+                    log.error(f"[CHAIN] Weight setting failed: {err}")
+                    self.total_failures += 1
+            except asyncio.TimeoutError:
+                log.error(f"[CHAIN] Weight setting timed out (120s), attempt {attempt + 1}/{1 + retries}")
                 self.total_failures += 1
-                return False
-        except asyncio.TimeoutError:
-            log.error("[CHAIN] Weight setting timed out (60s)")
-            self.total_failures += 1
-            return False
-        except Exception as e:
-            log.error(f"[CHAIN] Weight setting error: {e}")
-            self.total_failures += 1
-            return False
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            except Exception as e:
+                log.error(f"[CHAIN] Weight setting error: {e}")
+                self.total_failures += 1
+
+        return False
 
 
 # ── Real Model for Validator Verification ────────────────────────────────────
@@ -2498,7 +2510,7 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
             input_tokens=result["input_tokens"],
             output_tokens=result["output_tokens"],
             ttft_ms=result["ttft_ms"],
-            total_ms=result["ttft_ms"],
+            total_ms=result.get("_wall_time_ms", result["ttft_ms"]),
             tokens_per_sec=result["tokens_per_sec"],
         )
 
@@ -2544,8 +2556,11 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
     async def health(request: Request):
         """Health endpoint — always open. Detailed info requires monitoring auth."""
         alive = sum(1 for m in validator.router.miners.values() if m.alive)
+        uptime_s = time.time() - GATEWAY_START_TIME
         result = {
             "status": "ok",
+            "version": GATEWAY_VERSION,
+            "uptime_s": int(uptime_s),
             "model": validator.model.config.name,
             "miners_total": len(validator.router.miners),
             "miners_alive": alive,
@@ -2553,6 +2568,7 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
             # Public counters — needed by dashboard and monitoring
             "total_organic": validator.total_organic,
             "total_synthetic": validator.total_synthetic,
+            "last_weight_set": validator.chain.last_set_time if validator.chain else 0,
             "challenges": {
                 "total": validator.challenge_engine.total_challenges,
                 "passed": validator.challenge_engine.total_passed,
@@ -3295,7 +3311,7 @@ async def run_gateway(args):
 
     async def main_loop():
         await asyncio.sleep(1)
-        log.info(f"Hardened Gateway running on port {args.port}")
+        log.info(f"Hardened Gateway v{GATEWAY_VERSION} running on port {args.port}")
         log.info(f"Miners: {args.miners}")
         log.info(f"Epoch: {args.epoch_length}s | Synthetic interval: ~{args.synthetic_interval}s (with jitter)")
         if config.API_KEYS:
