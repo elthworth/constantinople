@@ -294,7 +294,9 @@ class VLLMMiner:
         try:
             outputs = self.hf_model(input_ids=input_ids, output_hidden_states=True)
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-            if "CUDA out of memory" in str(e) or "OutOfMemoryError" in type(e).__name__:
+            err_str = str(e)
+            if ("CUDA out of memory" in err_str or "OutOfMemoryError" in type(e).__name__
+                    or "same device" in err_str or "different from other" in err_str):
                 self._move_hf_to_cpu()
                 input_ids = input_ids.cpu()
                 outputs = self.hf_model(input_ids=input_ids, output_hidden_states=True)

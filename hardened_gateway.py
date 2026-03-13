@@ -1603,7 +1603,14 @@ class HardenedGatewayValidator:
             # predict the token sequence length from the prompt. Use our own model
             # to generate and get the token count.
             if hasattr(self.model, 'tokenizer'):
-                prompt_tokens = self.model.tokenizer.encode(prompt if not messages else prompt)
+                # When messages are provided, miner applies chat template — use same for estimation
+                if messages and hasattr(self.model.tokenizer, 'apply_chat_template'):
+                    est_prompt = self.model.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                else:
+                    est_prompt = prompt
+                prompt_tokens = self.model.tokenizer.encode(est_prompt)
                 estimated_seq_len = len(prompt_tokens) + max_tokens
             else:
                 gen_result = self.model.generate(prompt, max_tokens)
@@ -1655,7 +1662,13 @@ class HardenedGatewayValidator:
                 failover_challenge_params = None
                 if should_challenge:
                     if hasattr(self.model, 'tokenizer'):
-                        prompt_tokens = self.model.tokenizer.encode(prompt if not messages else prompt)
+                        if messages and hasattr(self.model.tokenizer, 'apply_chat_template'):
+                            fo_prompt = self.model.tokenizer.apply_chat_template(
+                                messages, tokenize=False, add_generation_prompt=True
+                            )
+                        else:
+                            fo_prompt = prompt
+                        prompt_tokens = self.model.tokenizer.encode(fo_prompt)
                         estimated_seq_len = len(prompt_tokens) + max_tokens
                     else:
                         gen_result = self.model.generate(prompt, max_tokens)
@@ -1749,21 +1762,30 @@ class HardenedGatewayValidator:
             inline_result = result.get("challenge_result")
 
             # Get tokens for reference computation
+            # When messages are provided, the miner applies apply_chat_template,
+            # so we must use the same template-wrapped text for validation.
+            if messages and hasattr(self.model, 'tokenizer') and hasattr(self.model.tokenizer, 'apply_chat_template'):
+                effective_prompt = self.model.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                effective_prompt = prompt
+
             miner_token_ids = result.get("all_token_ids")
             if miner_token_ids:
-                valid, reason = self._validate_token_ids(miner_token_ids, prompt, response_text)
+                valid, reason = self._validate_token_ids(miner_token_ids, effective_prompt, response_text)
                 if valid:
                     all_tokens = miner_token_ids
                 else:
                     log.warning(f"Miner {miner.uid} token_ids rejected: {reason}")
                     if hasattr(self.model, 'tokenizer'):
-                        full_text = prompt + response_text
+                        full_text = effective_prompt + response_text
                         all_tokens = self.model.tokenizer.encode(full_text)
                     else:
                         gen_result = self.model.generate(prompt, max_tokens)
                         all_tokens = gen_result["all_tokens"]
             elif hasattr(self.model, 'tokenizer'):
-                full_text = prompt + response_text
+                full_text = effective_prompt + response_text
                 all_tokens = self.model.tokenizer.encode(full_text)
             else:
                 gen_result = self.model.generate(prompt, max_tokens)
@@ -1827,6 +1849,11 @@ class HardenedGatewayValidator:
             challenge_passed = challenge_result["passed"]
             cos_sim = challenge_result["cosine_sim"]
             challenge_latency = challenge_result["latency_ms"]
+            log.info(
+                f"[CHALLENGE] Miner {miner.uid}: {'PASS' if challenge_passed else 'FAIL'} | "
+                f"cosine={cos_sim:.4f} latency={challenge_latency:.1f}ms "
+                f"layer={challenge_result.get('layer', '?')} pos={challenge_result.get('token_pos', '?')}"
+            )
 
         # Step 3: Score (Sybil-resistant: use per-miner medians for population ranking)
         medians_ttft, medians_tps = self.scoring.get_miner_medians()
@@ -2900,7 +2927,13 @@ async def _stream_response(
     challenge_params = None
     if should_challenge:
         if hasattr(validator.model, 'tokenizer'):
-            prompt_tokens = validator.model.tokenizer.encode(prompt if not messages else prompt)
+            if messages and hasattr(validator.model.tokenizer, 'apply_chat_template'):
+                st_est_prompt = validator.model.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                st_est_prompt = prompt
+            prompt_tokens = validator.model.tokenizer.encode(st_est_prompt)
             estimated_seq_len = len(prompt_tokens) + max_tokens
         else:
             gen_result = validator.model.generate(prompt, max_tokens)
@@ -3114,9 +3147,17 @@ async def _stream_response(
                 inline_result = final_meta.get("challenge_result")
 
                 # Get tokens for reference computation
+                # When messages are provided, use chat template for correct token alignment
+                if messages and hasattr(validator.model, 'tokenizer') and hasattr(validator.model.tokenizer, 'apply_chat_template'):
+                    st_eff_prompt = validator.model.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                else:
+                    st_eff_prompt = prompt
+
                 miner_token_ids = all_token_ids
                 if miner_token_ids:
-                    valid, reason = validator._validate_token_ids(miner_token_ids, prompt, all_text)
+                    valid, reason = validator._validate_token_ids(miner_token_ids, st_eff_prompt, all_text)
                     if valid:
                         all_tokens = miner_token_ids
                     else:
@@ -3128,7 +3169,7 @@ async def _stream_response(
                 # Fallback: validator produces token IDs if miner didn't (or they were rejected)
                 if not all_tokens:
                     if hasattr(validator.model, 'tokenizer'):
-                        full_text = prompt + all_text
+                        full_text = st_eff_prompt + all_text
                         all_tokens = validator.model.tokenizer.encode(full_text)
                     elif all_text:
                         gen_result = validator.model.generate(prompt, max_tokens)
@@ -3303,6 +3344,11 @@ async def run_gateway(args):
     if not model_name or model_name == "mock":
         log.warning("Using mock model — disabling hidden state challenges (speed-only scoring)")
         config.CHALLENGE_RATE = 0.0
+
+    # Override challenge rate if specified
+    if args.challenge_rate is not None:
+        config.CHALLENGE_RATE = max(0.0, min(1.0, args.challenge_rate))
+        log.info(f"Challenge rate set to {config.CHALLENGE_RATE:.1%}")
 
     # Chain integration (optional)
     chain = None
@@ -3757,6 +3803,7 @@ def main():
     parser.add_argument("--api-keys", default="", help="Comma-separated API keys (empty = no auth)")
     parser.add_argument("--monitoring-keys", default="", help="Comma-separated monitoring API keys (empty = open)")
     parser.add_argument("--model", default=None, help="HuggingFace model name for verification (default: mock)")
+    parser.add_argument("--challenge-rate", type=float, default=None, help="Challenge rate 0.0-1.0 (default: 1.0 with model, 0.0 without)")
     # Chain integration (optional — omit --wallet to run without chain)
     parser.add_argument("--wallet", default=None, help="Bittensor wallet name (enables chain weight-setting)")
     parser.add_argument("--hotkey", default="default", help="Bittensor hotkey name")
