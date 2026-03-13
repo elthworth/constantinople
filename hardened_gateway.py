@@ -2562,6 +2562,16 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
         """Health endpoint — always open. Detailed info requires monitoring auth."""
         alive = sum(1 for m in validator.router.miners.values() if m.alive)
         uptime_s = time.time() - GATEWAY_START_TIME
+        epoch_elapsed = time.time() - validator.scoring.current_epoch_start
+        epoch_length = validator.config.EPOCH_LENGTH_S
+
+        # Get last epoch weights if available
+        last_weights = {}
+        last_epoch_summary = None
+        if validator.epoch_summaries:
+            last_epoch_summary = validator.epoch_summaries[-1]
+            last_weights = last_epoch_summary.get("weights", {})
+
         result = {
             "status": "ok",
             "version": GATEWAY_VERSION,
@@ -2570,30 +2580,49 @@ def create_gateway_app(validator: HardenedGatewayValidator) -> FastAPI:
             "miners_total": len(validator.router.miners),
             "miners_alive": alive,
             "epoch": validator.scoring.epoch_number,
+            "epoch_elapsed_s": int(epoch_elapsed),
+            "epoch_length_s": epoch_length,
             # Public counters — needed by dashboard and monitoring
             "total_organic": validator.total_organic,
             "total_synthetic": validator.total_synthetic,
             "last_weight_set": validator.chain.last_set_time if validator.chain else 0,
+            "weights": {str(uid): round(w, 4) for uid, w in last_weights.items()},
             "challenges": {
                 "total": validator.challenge_engine.total_challenges,
                 "passed": validator.challenge_engine.total_passed,
                 "failed": validator.challenge_engine.total_failed,
             },
-            "miners_detail": [
-                {
-                    "uid": m.uid,
-                    "alive": m.alive,
-                    "endpoint": m.endpoint,
-                    "reliability": round(m.reliability_score, 3),
-                    "served": m.requests_served,
-                    "failed": m.requests_failed,
-                    "avg_ttft_ms": round(m.avg_ttft_ms, 1),
-                    "avg_tps": round(m.avg_tps, 1),
-                    "active": m.active_requests,
-                }
-                for m in validator.router.miners.values()
-            ],
+            "errors": {
+                "timeouts": validator.total_timeouts,
+                "miner_errors": validator.total_miner_errors,
+                "failovers": validator.total_failovers,
+            },
+            "miners_detail": [],
         }
+
+        # Build per-miner detail with scoring data
+        scoreboard = {s["uid"]: s for s in validator.scoring.get_scoreboard()}
+        for m in validator.router.miners.values():
+            detail = {
+                "uid": m.uid,
+                "alive": m.alive,
+                "endpoint": m.endpoint,
+                "reliability": round(m.reliability_score, 3),
+                "served": m.requests_served,
+                "failed": m.requests_failed,
+                "avg_ttft_ms": round(m.avg_ttft_ms, 1),
+                "avg_tps": round(m.avg_tps, 1),
+                "active": m.active_requests,
+            }
+            # Add scoring data from current epoch
+            if m.uid in scoreboard:
+                sb = scoreboard[m.uid]
+                detail["score"] = round(sb["net_points"], 3)
+                detail["weight"] = round(last_weights.get(m.uid, 0), 4)
+                detail["pass_rate"] = round(sb["pass_rate"], 3)
+                detail["divergence"] = round(sb["divergence"], 3)
+                detail["is_suspect"] = sb["is_suspect"]
+            result["miners_detail"].append(detail)
 
         # Extended info for authenticated monitoring requests
         is_authed = False
