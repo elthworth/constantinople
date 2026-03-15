@@ -551,20 +551,10 @@ def create_miner_app(miner_instance: MinerInstance) -> FastAPI:
     async def health():
         return {
             "status": "ok",
-            "miner_id": miner_instance.miner_id,
             "model": miner_instance.vllm_engine.model_name,
             "num_layers": miner_instance.vllm_engine.num_layers,
             "hidden_dim": miner_instance.vllm_engine.hidden_dim,
             "total_requests": miner_instance.total_requests,
-            "total_challenges": miner_instance.total_challenges,
-            "challenges_passed": miner_instance.challenges_passed,
-            "cache_size": miner_instance.cache.size,
-            "cache_hit_rate": miner_instance.cache.hit_rate,
-            "sampling_profile": {
-                "temperature_base": miner_instance.sampling_profile.temperature_base,
-                "temperature_variance": miner_instance.sampling_profile.temperature_variance,
-                "top_p": miner_instance.sampling_profile.top_p,
-            },
         }
 
     @app.post("/inference", response_model=InferenceResponse)

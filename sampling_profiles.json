@@ -64,7 +64,5 @@
       "presence_penalty": 0.0,
       "timing_jitter_ms": 11.0
     }
-  ],
-  "description": "Sampling profiles designed to create 30-60% response variation between miners while maintaining quality. Each profile uses different temperature ranges and top_p values to avoid collusion detection.",
-  "usage": "python3 shared_vllm_multi_miner.py --sampling-profiles sampling_profiles.json"
+  ]
 }
