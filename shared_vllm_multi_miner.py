@@ -208,13 +208,19 @@ class SharedVLLMEngine:
         tensor_parallel_size: int = 1,
         max_model_len: int = 4096,
         gpu_memory_utilization: float = 0.75,
+        max_concurrent_requests: int = 8,
     ):
         self.model_name = model_name
+        self.max_concurrent_requests = max_concurrent_requests
+        
+        # Semaphore to limit concurrent requests (prevents OOM from request spikes)
+        self.request_semaphore = asyncio.Semaphore(max_concurrent_requests)
         
         log.info(f"Initializing shared vLLM engine: {model_name}")
         log.info(f"  tensor_parallel_size={tensor_parallel_size}")
         log.info(f"  max_model_len={max_model_len}")
         log.info(f"  gpu_memory_utilization={gpu_memory_utilization}")
+        log.info(f"  max_concurrent_requests={max_concurrent_requests}")
 
         from vllm import AsyncLLMEngine, SamplingParams
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -286,23 +292,29 @@ class SharedVLLMEngine:
         
         request_id = request_id or str(uuid.uuid4())
         
-        # Submit to vLLM
-        results_generator = self.engine.generate(prompt, sampling_params, request_id)
-        
-        # Wait for completion
-        final_output = None
-        async for request_output in results_generator:
-            final_output = request_output
-        
-        if final_output is None:
-            raise RuntimeError("vLLM generation failed")
-        
-        output = final_output.outputs[0]
-        return {
-            "text": output.text,
-            "output_tokens": output.token_ids,
-            "prompt_tokens": len(final_output.prompt_token_ids),
-        }
+        # Acquire semaphore to limit concurrent requests
+        async with self.request_semaphore:
+            try:
+                # Submit to vLLM
+                results_generator = self.engine.generate(prompt, sampling_params, request_id)
+                
+                # Wait for completion
+                final_output = None
+                async for request_output in results_generator:
+                    final_output = request_output
+                
+                if final_output is None:
+                    raise RuntimeError("vLLM generation failed: no output received")
+                
+                output = final_output.outputs[0]
+                return {
+                    "text": output.text,
+                    "output_tokens": output.token_ids,
+                    "prompt_tokens": len(final_output.prompt_token_ids),
+                }
+            except Exception as e:
+                log.error(f"vLLM generation error for request {request_id}: {e}")
+                raise RuntimeError(f"vLLM engine error: {e}") from e
 
     @torch.no_grad()
     def extract_hidden_states(self, token_ids: list[int]) -> dict:
@@ -365,96 +377,103 @@ class MinerInstance:
         request_id = request.request_id or str(uuid.uuid4())
         self.total_requests += 1
         
-        # Apply sampling profile (with request-level jitter)
-        temperature = request.temperature or self.sampling_profile.sample_temperature()
-        top_p = request.top_p or self.sampling_profile.top_p
-        
-        # Build prompt
-        if request.messages:
-            prompt = self.vllm_engine.tokenizer.apply_chat_template(
-                request.messages,
-                tokenize=False,
-                add_generation_prompt=True,
+        try:
+            # Apply sampling profile (with request-level jitter)
+            temperature = request.temperature or self.sampling_profile.sample_temperature()
+            top_p = request.top_p or self.sampling_profile.top_p
+            
+            # Build prompt
+            if request.messages:
+                prompt = self.vllm_engine.tokenizer.apply_chat_template(
+                    request.messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            else:
+                prompt = request.prompt
+            
+            # Tokenize for hidden state extraction
+            inputs = self.vllm_engine.tokenizer(prompt, return_tensors="pt")
+            prompt_token_ids = inputs["input_ids"][0].tolist()
+            
+            # vLLM generation
+            t_start = time.perf_counter()
+            gen_result = await self.vllm_engine.generate(
+                prompt=prompt,
+                max_tokens=request.max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                request_id=request_id,
             )
-        else:
-            prompt = request.prompt
-        
-        # Tokenize for hidden state extraction
-        inputs = self.vllm_engine.tokenizer(prompt, return_tensors="pt")
-        prompt_token_ids = inputs["input_ids"][0].tolist()
-        
-        # vLLM generation
-        t_start = time.perf_counter()
-        gen_result = await self.vllm_engine.generate(
-            prompt=prompt,
-            max_tokens=request.max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            request_id=request_id,
-        )
-        t_gen = time.perf_counter()
-        
-        # Extract hidden states via HF forward pass
-        all_token_ids = prompt_token_ids + gen_result["output_tokens"]
-        hidden_states = self.vllm_engine.extract_hidden_states(all_token_ids)
-        t_hidden = time.perf_counter()
-        
-        # Cache hidden states
-        await self.cache.store(request_id, hidden_states)
-        
-        # Apply timing jitter to decorrelate latency patterns between miners
-        jitter_ms = self.sampling_profile.get_timing_jitter_ms()
-        if jitter_ms > 0:
-            await asyncio.sleep(jitter_ms / 1000.0)
-        
-        t_end = time.perf_counter()
-        
-        # Compute metrics
-        gen_time_ms = (t_gen - t_start) * 1000
-        hidden_time_ms = (t_hidden - t_gen) * 1000
-        total_time_ms = (t_end - t_start) * 1000
-        output_count = len(gen_result["output_tokens"])
-        tps = output_count / max(gen_time_ms / 1000, 0.001)
-        
-        # Handle inline challenge if present
-        challenge_result = None
-        if request.challenge_layer is not None and request.challenge_token is not None:
-            challenge_result = await self._serve_inline_challenge(
-                request_id,
-                request.challenge_layer,
-                request.challenge_token,
-                request.challenge_extra,
+            t_gen = time.perf_counter()
+            
+            # Extract hidden states via HF forward pass
+            all_token_ids = prompt_token_ids + gen_result["output_tokens"]
+            hidden_states = self.vllm_engine.extract_hidden_states(all_token_ids)
+            t_hidden = time.perf_counter()
+            
+            # Cache hidden states
+            await self.cache.store(request_id, hidden_states)
+            
+            # Apply timing jitter to decorrelate latency patterns between miners
+            jitter_ms = self.sampling_profile.get_timing_jitter_ms()
+            if jitter_ms > 0:
+                await asyncio.sleep(jitter_ms / 1000.0)
+            
+            t_end = time.perf_counter()
+            
+            # Compute metrics
+            gen_time_ms = (t_gen - t_start) * 1000
+            hidden_time_ms = (t_hidden - t_gen) * 1000
+            total_time_ms = (t_end - t_start) * 1000
+            output_count = len(gen_result["output_tokens"])
+            tps = output_count / max(gen_time_ms / 1000, 0.001)
+            
+            # Handle inline challenge if present
+            challenge_result = None
+            if request.challenge_layer is not None and request.challenge_token is not None:
+                challenge_result = await self._serve_inline_challenge(
+                    request_id,
+                    request.challenge_layer,
+                    request.challenge_token,
+                    request.challenge_extra,
+                )
+            
+            # Log request
+            self.request_log.append({
+                "request_id": request_id,
+                "timestamp": time.time(),
+                "input_tokens": gen_result["prompt_tokens"],
+                "output_tokens": output_count,
+                "ttft_ms": gen_time_ms,  # vLLM is async, so TTFT ≈ total for now
+                "tps": tps,
+            })
+            
+            log.info(
+                f"[Miner {self.miner_id}] Inference {request_id[:8]}... | "
+                f"{gen_result['prompt_tokens']} in + {output_count} out | "
+                f"{gen_time_ms:.1f}ms gen + {hidden_time_ms:.1f}ms hidden | "
+                f"{tps:.0f} tok/s | temp={temperature:.2f}"
+                f"{' +challenge' if challenge_result else ''}"
+            )
+            
+            return InferenceResponse(
+                request_id=request_id,
+                text=gen_result["text"],
+                input_tokens=gen_result["prompt_tokens"],
+                output_tokens=output_count,
+                ttft_ms=gen_time_ms,
+                total_ms=total_time_ms,
+                tokens_per_sec=tps,
+                all_token_ids=all_token_ids,
+                challenge_result=challenge_result,
             )
         
-        # Log request
-        self.request_log.append({
-            "request_id": request_id,
-            "timestamp": time.time(),
-            "input_tokens": gen_result["prompt_tokens"],
-            "output_tokens": output_count,
-            "ttft_ms": gen_time_ms,  # vLLM is async, so TTFT ≈ total for now
-            "tps": tps,
-        })
-        
-        log.info(
-            f"[Miner {self.miner_id}] Inference {request_id[:8]}... | "
-            f"{gen_result['prompt_tokens']} in + {output_count} out | "
-            f"{gen_time_ms:.1f}ms gen + {hidden_time_ms:.1f}ms hidden | "
-            f"{tps:.0f} tok/s | temp={temperature:.2f}"
-            f"{' +challenge' if challenge_result else ''}"
-        )
-        
-        return InferenceResponse(
-            request_id=request_id,
-            text=gen_result["text"],
-            input_tokens=gen_result["prompt_tokens"],
-            output_tokens=output_count,
-            ttft_ms=gen_time_ms,
-            total_ms=total_time_ms,
-            tokens_per_sec=tps,
-            all_token_ids=all_token_ids,
-            challenge_result=challenge_result,
-        )
+        except Exception as e:
+            log.error(f"[Miner {self.miner_id}] Inference failed for {request_id[:8]}...: {type(e).__name__}: {e}", exc_info=True)
+            # Return error response instead of crashing entire service
+            from fastapi import HTTPException
+            raise HTTPException(status_code=500, detail=f"Inference engine error: {str(e)}")
 
     async def _serve_inline_challenge(
         self,
@@ -589,6 +608,7 @@ class MultiMinerOrchestrator:
         self.vllm_engine = SharedVLLMEngine(
             model_name=model_name,
             gpu_memory_utilization=gpu_memory_utilization,
+            max_concurrent_requests=num_miners * 2,  # 2x miners for safety margin
         )
         
         # Initialize shared cache

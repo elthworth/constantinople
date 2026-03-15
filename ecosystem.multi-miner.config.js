@@ -4,7 +4,7 @@ module.exports = {
       name: 'multi-miner-orchestrator',
       script: 'shared_vllm_multi_miner.py',
       interpreter: 'python3',
-      args: '--base-port 8091 --num-miners 4 --model "Qwen/Qwen2.5-7B-Instruct" --gpu-memory-utilization 0.80 --cache-size 1500 --sampling-profiles sampling_profiles_h100.json',
+      args: '--base-port 8091 --num-miners 4 --model "Qwen/Qwen2.5-7B-Instruct" --gpu-memory-utilization 0.70 --cache-size 1200 --sampling-profiles sampling_profiles_h100.json',
       instances: 1,
       autorestart: true,
       watch: false,
