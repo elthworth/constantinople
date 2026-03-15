@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # Multi-miner orchestrator with shared vLLM
+  multi-miner:
+    build:
+      context: .
+      dockerfile: Dockerfile.multi-miner
+    container_name: inference-multi-miner
+    runtime: nvidia
+    environment:
+      - NUM_MINERS=${NUM_MINERS:-4}
+      - BASE_PORT=${BASE_PORT:-8091}
+      - MODEL_NAME=${MODEL_NAME:-Qwen/Qwen2.5-7B-Instruct}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.75}
+      - CACHE_SIZE=${CACHE_SIZE:-1000}
+      - NVIDIA_VISIBLE_DEVICES=all
+    ports:
+      - "${BASE_PORT:-8091}-${MAX_PORT:-8100}:${BASE_PORT:-8091}-${MAX_PORT:-8100}"
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+      - ./sampling_profiles.json:/app/sampling_profiles.json:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${BASE_PORT:-8091}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+volumes:
+  huggingface-cache:
+    driver: local

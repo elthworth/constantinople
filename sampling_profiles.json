@@ -1,0 +1,70 @@
+{
+  "profiles": [
+    {
+      "temperature_base": 0.65,
+      "temperature_variance": 0.15,
+      "top_p": 0.90,
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.0,
+      "timing_jitter_ms": 8.0
+    },
+    {
+      "temperature_base": 0.75,
+      "temperature_variance": 0.12,
+      "top_p": 0.92,
+      "frequency_penalty": 0.05,
+      "presence_penalty": 0.0,
+      "timing_jitter_ms": 6.0
+    },
+    {
+      "temperature_base": 0.70,
+      "temperature_variance": 0.18,
+      "top_p": 0.88,
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.05,
+      "timing_jitter_ms": 10.0
+    },
+    {
+      "temperature_base": 0.80,
+      "temperature_variance": 0.10,
+      "top_p": 0.95,
+      "frequency_penalty": 0.1,
+      "presence_penalty": 0.0,
+      "timing_jitter_ms": 5.0
+    },
+    {
+      "temperature_base": 0.68,
+      "temperature_variance": 0.20,
+      "top_p": 0.85,
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.1,
+      "timing_jitter_ms": 12.0
+    },
+    {
+      "temperature_base": 0.72,
+      "temperature_variance": 0.14,
+      "top_p": 0.93,
+      "frequency_penalty": 0.08,
+      "presence_penalty": 0.02,
+      "timing_jitter_ms": 7.0
+    },
+    {
+      "temperature_base": 0.78,
+      "temperature_variance": 0.16,
+      "top_p": 0.87,
+      "frequency_penalty": 0.02,
+      "presence_penalty": 0.08,
+      "timing_jitter_ms": 9.0
+    },
+    {
+      "temperature_base": 0.66,
+      "temperature_variance": 0.13,
+      "top_p": 0.91,
+      "frequency_penalty": 0.12,
+      "presence_penalty": 0.0,
+      "timing_jitter_ms": 11.0
+    }
+  ],
+  "description": "Sampling profiles designed to create 30-60% response variation between miners while maintaining quality. Each profile uses different temperature ranges and top_p values to avoid collusion detection.",
+  "usage": "python3 shared_vllm_multi_miner.py --sampling-profiles sampling_profiles.json"
+}
