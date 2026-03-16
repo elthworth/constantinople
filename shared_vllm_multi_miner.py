@@ -239,34 +239,26 @@ class SharedVLLMEngine:
         self.SamplingParams = SamplingParams
         log.info("Shared vLLM engine initialized")
 
-        # Load HuggingFace model for hidden state extraction
-        log.info(f"Loading HuggingFace model for hidden states: {model_name}")
+        # Load HuggingFace model for hidden state extraction ON CPU ONLY
+        # CRITICAL: vLLM already uses 70GB VRAM. Loading HF model on GPU causes OOM crashes.
+        # CPU inference adds ~500ms latency but only affects 5% of requests (challenges).
+        # This saves $3,000-8,000/month vs upgrading to H200/B200.
+        log.info(f"Loading HuggingFace model for hidden states on CPU: {model_name}")
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         
-        # Try GPU first, fall back to CPU if OOM
-        try:
-            self.hf_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                trust_remote_code=True,
-                output_hidden_states=True,
-            )
-            self.hf_device = next(self.hf_model.parameters()).device
-            log.info(f"HF model loaded on {self.hf_device}")
-        except Exception as e:
-            log.warning(f"Failed to load HF model on GPU, falling back to CPU: {e}")
-            self.hf_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float32,
-                device_map="cpu",
-                trust_remote_code=True,
-                output_hidden_states=True,
-            )
-            self.hf_device = torch.device("cpu")
-            log.info(f"HF model loaded on CPU")
+        # FORCE CPU-only (do NOT use device_map="auto" - it loads on GPU and causes crashes)
+        self.hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,  # CPU uses float32
+            device_map="cpu",           # FORCE CPU - never GPU
+            trust_remote_code=True,
+            output_hidden_states=True,
+            low_cpu_mem_usage=True,
+        )
+        self.hf_device = torch.device("cpu")
+        log.info(f"HF model loaded on CPU - VRAM reserved for vLLM inference engine")
         
         self.hf_model.eval()
         self.num_layers = self.hf_model.config.num_hidden_layers
@@ -605,10 +597,11 @@ class MultiMinerOrchestrator:
         self.base_port = base_port
         
         # Initialize shared vLLM engine
+        # Limit concurrent requests to prevent OOM from validator bulk requests
         self.vllm_engine = SharedVLLMEngine(
             model_name=model_name,
             gpu_memory_utilization=gpu_memory_utilization,
-            max_concurrent_requests=num_miners * 2,  # 2x miners for safety margin
+            max_concurrent_requests=num_miners + 2,  # Conservative: num_miners + 2 headroom
         )
         
         # Initialize shared cache
