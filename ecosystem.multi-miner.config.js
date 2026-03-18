@@ -18,6 +18,8 @@ module.exports = {
         CUDA_LAUNCH_BLOCKING: '0',  // Async CUDA launches (faster)
         PYTORCH_CUDA_ALLOC_CONF: 'expandable_segments:True',  // Reduce memory fragmentation
         VLLM_WORKER_MULTIPROC_METHOD: 'spawn',  // More stable than fork on new GPUs
+        VLLM_USE_RAY_COMPILED_DAG: '0',  // Disable Ray for stability
+        VLLM_ALLOW_RUNTIME_LORA_UPDATING: '0',  // Reduce overhead
       },
       error_file: 'logs/multi-miner-error.log',
       out_file: 'logs/multi-miner-out.log',

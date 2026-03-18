@@ -238,21 +238,33 @@ class SharedVLLMEngine:
         from vllm.engine.arg_utils import AsyncEngineArgs
 
         # B200-specific optimizations and stability fixes
-        engine_args = AsyncEngineArgs(
-            model=model_name,
-            tensor_parallel_size=tensor_parallel_size,
-            max_model_len=max_model_len,
-            gpu_memory_utilization=gpu_memory_utilization,
-            trust_remote_code=True,
-            dtype="bfloat16",  # B200 optimized for bfloat16, more stable than float16
-            disable_log_stats=False,  # Enable for debugging crashes
-            enforce_eager=False,  # Allow CUDA graphs for better stability
-            max_num_seqs=max_concurrent_requests,  # Prevent OOM from batch size spikes
-            max_num_batched_tokens=8192,  # Conservative limit to prevent memory spikes
-            enable_prefix_caching=True,  # Reduce memory fragmentation
-            disable_custom_all_reduce=True,  # Fixes multi-GPU instability on new architectures
-            worker_use_ray=False,  # Use multiprocessing instead of Ray (more stable)
-        )
+        # Build engine args with only supported parameters
+        engine_args_dict = {
+            "model": model_name,
+            "tensor_parallel_size": tensor_parallel_size,
+            "max_model_len": max_model_len,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "trust_remote_code": True,
+            "dtype": "bfloat16",  # B200 optimized for bfloat16, more stable than float16
+            "disable_log_stats": False,  # Enable for debugging crashes
+            "enforce_eager": False,  # Allow CUDA graphs for better stability
+        }
+        
+        # Add optional parameters only if supported by vLLM version
+        try:
+            # Try batch size limits (newer vLLM versions)
+            engine_args_dict["max_num_seqs"] = max_concurrent_requests
+            engine_args_dict["max_num_batched_tokens"] = 8192
+        except:
+            log.warning("max_num_seqs/max_num_batched_tokens not supported in this vLLM version")
+        
+        try:
+            # Try prefix caching (reduces memory fragmentation)
+            engine_args_dict["enable_prefix_caching"] = True
+        except:
+            log.warning("enable_prefix_caching not supported in this vLLM version")
+        
+        engine_args = AsyncEngineArgs(**engine_args_dict)
         
         try:
             self.engine = AsyncLLMEngine.from_engine_args(engine_args)
