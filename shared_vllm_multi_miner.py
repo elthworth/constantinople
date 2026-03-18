@@ -46,8 +46,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import secrets
+import sys
 import time
+import traceback
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -62,6 +65,13 @@ from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("shared_vllm_multi_miner")
+
+# CRITICAL: Prevent NCCL initialization issues on single-GPU setups
+# The B200 crashes are partially caused by NCCL being initialized unnecessarily
+os.environ.setdefault("NCCL_DEBUG", "ERROR")  # Reduce NCCL logging
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")  # Disable P2P (not needed for single GPU)
+os.environ.setdefault("NCCL_SHM_DISABLE", "1")  # Disable shared memory (stability)
+os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")  # Prevent async NCCL hangs
 
 
 # ── Request/Response Models ──────────────────────────────────────────────────
@@ -196,11 +206,84 @@ class SharedHiddenStateCache:
 
 # ── Shared vLLM Engine ───────────────────────────────────────────────────────
 
+# ── Global Stats and Monitoring ──────────────────────────────────────────────
+
+class EngineStats:
+    """Track engine health and request stats for crash diagnosis"""
+    def __init__(self):
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.last_request_time = None
+        self.start_time = time.time()
+        self.last_gpu_memory_check = time.time()
+        self.gpu_memory_samples = deque(maxlen=100)
+        
+    def log_request_start(self, request_id: str):
+        self.total_requests += 1
+        self.last_request_time = time.time()
+        
+    def log_request_success(self):
+        self.successful_requests += 1
+        
+    def log_request_failure(self):
+        self.failed_requests += 1
+        
+    def check_gpu_memory(self):
+        """Periodically log GPU memory to detect leaks"""
+        now = time.time()
+        if now - self.last_gpu_memory_check > 60:  # Every 60s
+            try:
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated(0) / 1e9
+                    reserved = torch.cuda.memory_reserved(0) / 1e9
+                    total = torch.cuda.get_device_properties(0).total_memory / 1e9
+                    pct = (reserved / total) * 100
+                    
+                    self.gpu_memory_samples.append((now, reserved, pct))
+                    
+                    log.info(f"[GPU Memory] {reserved:.2f}GB / {total:.2f}GB ({pct:.1f}%)")
+                    
+                    # Detect memory leak
+                    if len(self.gpu_memory_samples) >= 5:
+                        recent_pcts = [s[2] for s in list(self.gpu_memory_samples)[-5:]]
+                        if all(recent_pcts[i] < recent_pcts[i+1] for i in range(4)):
+                            log.warning(f"⚠️  MEMORY LEAK DETECTED: Steady increase over last 5 checks")
+                            log.warning(f"   Memory trend: {recent_pcts}")
+                    
+                    if pct > 85:
+                        log.error(f"🚨 HIGH GPU MEMORY: {pct:.1f}% - close to OOM!")
+                        # Force garbage collection
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        log.info("   Ran garbage collection and cleared CUDA cache")
+                        
+            except Exception as e:
+                log.error(f"Failed to check GPU memory: {e}")
+            
+            self.last_gpu_memory_check = now
+    
+    def get_stats(self) -> dict:
+        uptime = time.time() - self.start_time
+        return {
+            "uptime_seconds": int(uptime),
+            "total_requests": self.total_requests,
+            "successful_requests": self.successful_requests,
+            "failed_requests": self.failed_requests,
+            "success_rate": (self.successful_requests / max(1, self.total_requests)) * 100,
+            "requests_per_minute": (self.total_requests / max(1, uptime / 60)),
+        }
+
+
 class SharedVLLMEngine:
     """
     Single vLLM engine shared across all miner instances.
     Handles generation only; hidden state extraction done by HF model.
     """
+    
+    # Class-level stats for monitoring
+    stats = EngineStats()
 
     def __init__(
         self,
@@ -311,6 +394,11 @@ class SharedVLLMEngine:
         )
         
         request_id = request_id or str(uuid.uuid4())
+        
+        # Track request stats
+        SharedVLLMEngine.stats.log_request_start(request_id)
+        SharedVLLMEngine.stats.check_gpu_memory()
+        
         log.info(f"[vLLM] Starting generation for request {request_id[:8]}... (max_tokens={max_tokens}, temp={temperature:.2f})")
         
         # Acquire semaphore to limit concurrent requests
@@ -334,16 +422,27 @@ class SharedVLLMEngine:
                     "output_tokens": output.token_ids,
                     "prompt_tokens": len(final_output.prompt_token_ids),
                 }
+                SharedVLLMEngine.stats.log_request_success()
                 log.info(f"[vLLM] Request {request_id[:8]} completed: {len(output.token_ids)} tokens generated")
+                
+                # Log aggregate stats periodically
+                if SharedVLLMEngine.stats.total_requests % 10 == 0:
+                    stats = SharedVLLMEngine.stats.get_stats()
+                    log.info(f"[Stats] {stats['total_requests']} requests | {stats['success_rate']:.1f}% success | {stats['requests_per_minute']:.1f} req/min")
+                
                 return result
             except asyncio.CancelledError:
+                SharedVLLMEngine.stats.log_request_failure()
                 log.error(f"[vLLM] Request {request_id[:8]} was CANCELLED (engine crashed or shutdown)")
+                log.error(f"[vLLM] 🚨 ENGINE CRASH DETECTED 🚨")
+                log.error(f"[vLLM] Stats before crash: {SharedVLLMEngine.stats.get_stats()}")
                 raise
             except Exception as e:
+                SharedVLLMEngine.stats.log_request_failure()
                 log.error(f"[vLLM] Generation error for request {request_id[:8]}: {e}")
                 log.error(f"[vLLM] Error type: {type(e).__name__}")
-                import traceback
                 log.error(f"[vLLM] Traceback: {traceback.format_exc()}")
+                log.error(f"[vLLM] Stats at error: {SharedVLLMEngine.stats.get_stats()}")
                 raise RuntimeError(f"vLLM engine error: {e}") from e
 
     @torch.no_grad()
@@ -598,12 +697,31 @@ def create_miner_app(miner_instance: MinerInstance) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        # Get GPU memory stats
+        gpu_stats = {}
+        try:
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(0) / 1e9
+                reserved = torch.cuda.memory_reserved(0) / 1e9
+                total = torch.cuda.get_device_properties(0).total_memory / 1e9
+                gpu_stats = {
+                    "allocated_gb": round(allocated, 2),
+                    "reserved_gb": round(reserved, 2),
+                    "total_gb": round(total, 2),
+                    "utilization_pct": round((reserved / total) * 100, 1),
+                }
+        except Exception as e:
+            gpu_stats = {"error": str(e)}
+        
         return {
             "status": "ok",
+            "miner_id": miner_instance.miner_id,
             "model": miner_instance.vllm_engine.model_name,
             "num_layers": miner_instance.vllm_engine.num_layers,
             "hidden_dim": miner_instance.vllm_engine.hidden_dim,
             "total_requests": miner_instance.total_requests,
+            "engine_stats": SharedVLLMEngine.stats.get_stats(),
+            "gpu_memory": gpu_stats,
         }
 
     @app.post("/inference", response_model=InferenceResponse)

@@ -20,6 +20,12 @@ module.exports = {
         VLLM_WORKER_MULTIPROC_METHOD: 'spawn',  // More stable than fork on new GPUs
         VLLM_USE_RAY_COMPILED_DAG: '0',  // Disable Ray for stability
         VLLM_ALLOW_RUNTIME_LORA_UPDATING: '0',  // Reduce overhead
+        // NCCL settings - prevent crashes on single-GPU B200
+        NCCL_DEBUG: 'ERROR',  // Reduce NCCL logging noise
+        NCCL_P2P_DISABLE: '1',  // Disable peer-to-peer (not needed on single GPU)
+        NCCL_SHM_DISABLE: '1',  // Disable shared memory (improves stability)
+        TORCH_NCCL_BLOCKING_WAIT: '1',  // Prevent async NCCL hangs
+        TORCH_NCCL_ASYNC_ERROR_HANDLING: '1',  // Better error handling
       },
       error_file: 'logs/multi-miner-error.log',
       out_file: 'logs/multi-miner-out.log',
