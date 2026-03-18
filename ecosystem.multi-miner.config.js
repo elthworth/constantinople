@@ -4,8 +4,8 @@ module.exports = {
       name: 'multi-miner-orchestrator',
       script: 'shared_vllm_multi_miner.py',
       interpreter: 'python3',
-      // B200 optimized settings: reduced GPU memory to prevent OOM
-      args: '--base-port 8091 --num-miners 4 --model "Qwen/Qwen2.5-7B-Instruct" --gpu-memory-utilization 0.70 --cache-size 800 --sampling-profiles sampling_profiles_h100.json',
+      // B200 stability fix: aggressive memory reduction + fewer miners
+      args: '--base-port 8091 --num-miners 3 --model "Qwen/Qwen2.5-7B-Instruct" --gpu-memory-utilization 0.60 --cache-size 600 --sampling-profiles sampling_profiles_h100.json',
       instances: 1,
       autorestart: true,
       watch: false,

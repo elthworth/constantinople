@@ -206,7 +206,7 @@ class SharedVLLMEngine:
         self,
         model_name: str = "Qwen/Qwen2.5-7B-Instruct",
         tensor_parallel_size: int = 1,
-        max_model_len: int = 4096,
+        max_model_len: int = 3072,  # Reduced from 4096 for B200 stability
         gpu_memory_utilization: float = 0.75,
         max_concurrent_requests: int = 8,
     ):
@@ -237,32 +237,24 @@ class SharedVLLMEngine:
         from vllm import AsyncLLMEngine, SamplingParams
         from vllm.engine.arg_utils import AsyncEngineArgs
 
-        # B200-specific optimizations and stability fixes
-        # Build engine args with only supported parameters
+        # CRITICAL: B200 stability fix - use conservative settings
+        # Build engine args with only stable, battle-tested parameters
+        log.info("Building vLLM engine with stability-first configuration...")
+        
         engine_args_dict = {
             "model": model_name,
             "tensor_parallel_size": tensor_parallel_size,
             "max_model_len": max_model_len,
             "gpu_memory_utilization": gpu_memory_utilization,
             "trust_remote_code": True,
-            "dtype": "bfloat16",  # B200 optimized for bfloat16, more stable than float16
+            "dtype": "auto",  # Let vLLM choose optimal dtype for stability
             "disable_log_stats": False,  # Enable for debugging crashes
-            "enforce_eager": False,  # Allow CUDA graphs for better stability
+            "enforce_eager": True,  # CRITICAL: Disable CUDA graphs - more stable, fixes core crashes
+            "max_num_seqs": max_concurrent_requests,  # Strict limit on parallel sequences
         }
         
-        # Add optional parameters only if supported by vLLM version
-        try:
-            # Try batch size limits (newer vLLM versions)
-            engine_args_dict["max_num_seqs"] = max_concurrent_requests
-            engine_args_dict["max_num_batched_tokens"] = 8192
-        except:
-            log.warning("max_num_seqs/max_num_batched_tokens not supported in this vLLM version")
-        
-        try:
-            # Try prefix caching (reduces memory fragmentation)
-            engine_args_dict["enable_prefix_caching"] = True
-        except:
-            log.warning("enable_prefix_caching not supported in this vLLM version")
+        log.info(f"Engine args: enforce_eager=True (CUDA graphs disabled for stability)")
+        log.info(f"Engine args: dtype=auto, max_num_seqs={max_concurrent_requests}")
         
         engine_args = AsyncEngineArgs(**engine_args_dict)
         
@@ -319,12 +311,14 @@ class SharedVLLMEngine:
         )
         
         request_id = request_id or str(uuid.uuid4())
+        log.info(f"[vLLM] Starting generation for request {request_id[:8]}... (max_tokens={max_tokens}, temp={temperature:.2f})")
         
         # Acquire semaphore to limit concurrent requests
         async with self.request_semaphore:
             try:
                 # Submit to vLLM
                 results_generator = self.engine.generate(prompt, sampling_params, request_id)
+                log.debug(f"[vLLM] Request {request_id[:8]} submitted to engine")
                 
                 # Wait for completion
                 final_output = None
@@ -335,17 +329,21 @@ class SharedVLLMEngine:
                     raise RuntimeError("vLLM generation failed: no output received")
                 
                 output = final_output.outputs[0]
-                return {
+                result = {
                     "text": output.text,
                     "output_tokens": output.token_ids,
                     "prompt_tokens": len(final_output.prompt_token_ids),
                 }
+                log.info(f"[vLLM] Request {request_id[:8]} completed: {len(output.token_ids)} tokens generated")
+                return result
             except asyncio.CancelledError:
-                log.error(f"Request {request_id} was cancelled (engine may have crashed)")
+                log.error(f"[vLLM] Request {request_id[:8]} was CANCELLED (engine crashed or shutdown)")
                 raise
             except Exception as e:
-                log.error(f"vLLM generation error for request {request_id}: {e}")
-                log.error(f"Error type: {type(e).__name__}")
+                log.error(f"[vLLM] Generation error for request {request_id[:8]}: {e}")
+                log.error(f"[vLLM] Error type: {type(e).__name__}")
+                import traceback
+                log.error(f"[vLLM] Traceback: {traceback.format_exc()}")
                 raise RuntimeError(f"vLLM engine error: {e}") from e
 
     @torch.no_grad()
@@ -638,10 +636,12 @@ class MultiMinerOrchestrator:
         
         # Initialize shared vLLM engine
         # Limit concurrent requests to prevent OOM from validator bulk requests
+        # CRITICAL: Reduce max_concurrent_requests for B200 stability
         self.vllm_engine = SharedVLLMEngine(
             model_name=model_name,
             gpu_memory_utilization=gpu_memory_utilization,
-            max_concurrent_requests=num_miners + 2,  # Conservative: num_miners + 2 headroom
+            max_concurrent_requests=num_miners,  # One concurrent request per miner max
+            max_model_len=2048,  # Aggressive reduction for stability
         )
         
         # Initialize shared cache
@@ -692,6 +692,17 @@ class MultiMinerOrchestrator:
 # ── Main Entry Point ─────────────────────────────────────────────────────────
 
 def main():
+    import signal
+    import sys
+    
+    # Graceful shutdown handler
+    def signal_handler(sig, frame):
+        log.info("Received shutdown signal, cleaning up...")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     parser = argparse.ArgumentParser(
         description="Shared vLLM Multi-Miner Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
