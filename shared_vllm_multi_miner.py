@@ -221,23 +221,47 @@ class SharedVLLMEngine:
         log.info(f"  max_model_len={max_model_len}")
         log.info(f"  gpu_memory_utilization={gpu_memory_utilization}")
         log.info(f"  max_concurrent_requests={max_concurrent_requests}")
+        
+        # Detect GPU and log info
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+                log.info(f"  GPU: {gpu_name} ({gpu_memory:.1f} GB)")
+            else:
+                log.warning("No CUDA GPU detected!")
+        except Exception as e:
+            log.warning(f"Could not detect GPU: {e}")
 
         from vllm import AsyncLLMEngine, SamplingParams
         from vllm.engine.arg_utils import AsyncEngineArgs
 
+        # B200-specific optimizations and stability fixes
         engine_args = AsyncEngineArgs(
             model=model_name,
             tensor_parallel_size=tensor_parallel_size,
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             trust_remote_code=True,
-            dtype="float16",
-            disable_log_stats=True,
+            dtype="bfloat16",  # B200 optimized for bfloat16, more stable than float16
+            disable_log_stats=False,  # Enable for debugging crashes
+            enforce_eager=False,  # Allow CUDA graphs for better stability
+            max_num_seqs=max_concurrent_requests,  # Prevent OOM from batch size spikes
+            max_num_batched_tokens=8192,  # Conservative limit to prevent memory spikes
+            enable_prefix_caching=True,  # Reduce memory fragmentation
+            disable_custom_all_reduce=True,  # Fixes multi-GPU instability on new architectures
+            worker_use_ray=False,  # Use multiprocessing instead of Ray (more stable)
         )
         
-        self.engine = AsyncLLMEngine.from_engine_args(engine_args)
-        self.SamplingParams = SamplingParams
-        log.info("Shared vLLM engine initialized")
+        try:
+            self.engine = AsyncLLMEngine.from_engine_args(engine_args)
+            self.SamplingParams = SamplingParams
+            log.info("Shared vLLM engine initialized successfully")
+        except Exception as e:
+            log.error(f"Failed to initialize vLLM engine: {e}")
+            log.error("Try reducing --gpu-memory-utilization or --num-miners")
+            raise
 
         # Load HuggingFace model for hidden state extraction ON CPU ONLY
         # CRITICAL: vLLM already uses 70GB VRAM. Loading HF model on GPU causes OOM crashes.
@@ -304,8 +328,12 @@ class SharedVLLMEngine:
                     "output_tokens": output.token_ids,
                     "prompt_tokens": len(final_output.prompt_token_ids),
                 }
+            except asyncio.CancelledError:
+                log.error(f"Request {request_id} was cancelled (engine may have crashed)")
+                raise
             except Exception as e:
                 log.error(f"vLLM generation error for request {request_id}: {e}")
+                log.error(f"Error type: {type(e).__name__}")
                 raise RuntimeError(f"vLLM engine error: {e}") from e
 
     @torch.no_grad()
